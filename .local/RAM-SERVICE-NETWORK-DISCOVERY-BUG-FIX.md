@@ -7,14 +7,17 @@ Gateway API Controller fails to discover VPC Lattice Service Networks shared via
 - `DEFAULT_SERVICE_NETWORK` environment variable is set correctly
 - RAM sharing is verified working with AWS CLI
 
-## Root Cause Analysis
+## Root Cause Analysis - UPDATE: Configuration Issue Found!
 
-### Bug Location
+**ACTUAL ROOT CAUSE**: The real issue was in the **terraform configuration**, not the controller code!
+
+The terraform module (`otp-fixtures/modules/gateway_api_controller/locals.tf`) was **missing the `enableServiceNetworkOverride` helm value**, which meant the controller never enabled override mode and searched for a service network named after the Gateway name instead of using `DEFAULT_SERVICE_NETWORK`.
+
+### Secondary Issue (Addressed in this PR)
 File: `pkg/aws/services/vpclattice.go`
 Function: `findServiceNetworkViaVPCAssociation()`
 
-### The Issue
-The `findServiceNetworkViaVPCAssociation` function requires `config.VpcID` to be set to list VPC-to-Service Network associations. However, there's a critical flaw in the logic flow:
+While the primary issue was configuration, this function also has a defensive coding issue:
 
 ```go
 func (d *defaultLattice) FindServiceNetwork(ctx context.Context, nameOrId string) (*ServiceNetworkInfo, error) {
@@ -33,16 +36,22 @@ func (d *defaultLattice) FindServiceNetwork(ctx context.Context, nameOrId string
 }
 ```
 
-**The Problem**: When `ServiceNetworkOverrideMode` is true and a Gateway is created with name "pr-36-tokenizer-gateway":
-1. `FindServiceNetwork` is called with `nameOrId = "pr-36-tokenizer-gateway"` (the Gateway name)
-2. `nameOrId` gets overridden to `config.DefaultServiceNetwork` (e.g., "sn-04f8437d5c6e026b0")
-3. Local search fails (service network is RAM-shared, not local)
-4. `findServiceNetworkViaVPCAssociation` is called with the OVERRIDDEN value
-5. Function tries to find a VPC association matching the service network ID
-6. **BUT**: The function may not have proper error handling or `config.VpcID` validation
+**What Actually Happened**:
+1. Gateway created with name "pr-36-tokenizer-gateway"
+2. `FindServiceNetwork` called with `nameOrId = "pr-36-tokenizer-gateway"`
+3. **BUT** `ServiceNetworkOverrideMode` was FALSE (not configured in terraform!)
+4. Controller searches for service network named "pr-36-tokenizer-gateway"
+5. **FAILS** - No service network with that name exists
 
-### Secondary Issue
-The `findServiceNetworkViaVPCAssociation` function doesn't validate that `config.VpcID` is set:
+**What Should Happen**:
+1. Gateway created with name "pr-36-tokenizer-gateway"
+2. `FindServiceNetwork` called with `nameOrId = "pr-36-tokenizer-gateway"`  
+3. `ServiceNetworkOverrideMode` is TRUE → overrides to `config.DefaultServiceNetwork`
+4. Controller searches for "sn-04f8437d5c6e026b0"
+5. **SUCCESS** - Finds the RAM-shared service network
+
+### The Defensive Coding Issue
+Even with correct configuration, `findServiceNetworkViaVPCAssociation` lacks validation:
 
 ```go
 func (d *defaultLattice) findServiceNetworkViaVPCAssociation(ctx context.Context, nameOrId string) (*ServiceNetworkInfo, error) {
@@ -52,12 +61,25 @@ func (d *defaultLattice) findServiceNetworkViaVPCAssociation(ctx context.Context
         })
 ```
 
-If `config.VpcID` is not set or empty, the AWS API call will fail or return no results.
+If `config.VpcID` is not set, the function fails with unclear error messages.
 
-## The Fix
+## The Fixes
 
-### Solution 1: Add VPC ID Validation (Primary Fix)
-Add validation in `findServiceNetworkViaVPCAssociation` to ensure `config.VpcID` is set:
+### Fix 1: Terraform Configuration (PRIMARY - In otp-fixtures repo)
+**File**: `otp-fixtures/modules/gateway_api_controller/locals.tf`  
+**Change**: Added missing helm value
+
+```hcl
+{
+  name  = "enableServiceNetworkOverride"
+  value = "true"
+}
+```
+
+This was the actual blocker - without this, override mode was never enabled!
+
+### Fix 2: Add VPC ID Validation (SECONDARY - This PR)
+Add defensive validation in `findServiceNetworkViaVPCAssociation` to ensure `config.VpcID` is set:
 
 ```go
 func (d *defaultLattice) findServiceNetworkViaVPCAssociation(ctx context.Context, nameOrId string) (*ServiceNetworkInfo, error) {
@@ -75,23 +97,11 @@ func (d *defaultLattice) findServiceNetworkViaVPCAssociation(ctx context.Context
 }
 ```
 
-### Solution 2: Add Logging for Debugging
-Add debug logging to help troubleshoot discovery issues:
-
-```go
-func (d *defaultLattice) FindServiceNetwork(ctx context.Context, nameOrId string) (*ServiceNetworkInfo, error) {
-    originalNameOrId := nameOrId
-    
-    // When default service network is provided, override for any kind of SN search
-    if config.ServiceNetworkOverrideMode {
-        nameOrId = config.DefaultServiceNetwork
-        // Log the override for debugging
-        log.Infof(ctx, "Service network override enabled: searching for %s instead of %s", 
-            nameOrId, originalNameOrId)
-    }
-    ...
-}
-```
+### Why This Fix Matters
+Even though the primary issue was configuration, this validation provides:
+1. **Better error messages** when `CLUSTER_VPC_ID` is misconfigured
+2. **Defensive programming** - fail fast with clear errors
+3. **Easier debugging** for future issues
 
 ## Testing the Fix
 
@@ -119,9 +129,17 @@ kubectl get gateway -n pr-36-tokenizer pr-36-tokenizer-gateway
 1. `pkg/aws/services/vpclattice.go` - Add VPC ID validation and improved logging
 
 ## Impact
-- **High Priority**: Blocks all Gateway deployments when using RAM-shared service networks
-- **Affects**: Any deployment using `DEFAULT_SERVICE_NETWORK` with RAM sharing
-- **Risk**: Low - adds validation that should have been there from the start
+
+### Primary Issue (Configuration)
+- **Priority**: Critical - Was the actual blocker
+- **Resolution**: Fixed in otp-fixtures terraform module
+- **Affects**: All Gateway API Controller deployments
+
+### This PR (Validation Fix)
+- **Priority**: Low - Defensive improvement
+- **Benefit**: Better error messages and debugging
+- **Risk**: None - Pure validation addition
+- **Affects**: Future misconfigurations will be easier to diagnose
 
 ## Related Issues
 - Relates to RAM-based service network discovery feature
